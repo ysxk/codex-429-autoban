@@ -1,0 +1,12 @@
+# Local build artifacts
+*.dll
+*.so
+*.dylib
+*.h
+
+# Go workspace files
+go.sum
+
+# OS clutter
+.DS_Store
+Thumbs.db

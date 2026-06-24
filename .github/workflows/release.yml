@@ -1,0 +1,113 @@
+# Build and release the codex-429-autoban plugin for all supported platforms.
+#
+# Triggered by pushing a tag named v<version> (e.g. v0.1.0). For each platform
+# it builds the CGO dynamic library with the host's native C toolchain, packs
+# it into the zip layout required by the CLIProxyAPI plugin store, and uploads
+# everything to the GitHub Release bound to that tag.
+#
+# Output assets (version = tag without the leading "v"):
+#   codex-429-autoban_<version>_linux_amd64.zip      -> codex-429-autoban.so
+#   codex-429-autoban_<version>_darwin_arm64.zip     -> codex-429-autoban.dylib
+#   codex-429-autoban_<version>_windows_amd64.zip    -> codex-429-autoban.dll
+#   checksums.txt
+name: Release Plugin
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            runner: ubuntu-latest
+            ext: so
+          - goos: darwin
+            goarch: arm64
+            runner: macos-latest
+            ext: dylib
+          - goos: windows
+            goarch: amd64
+            runner: windows-latest
+            ext: dll
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+          cache: true
+
+      - name: Build dynamic library
+        env:
+          CGO_ENABLED: "1"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          go build -buildmode=c-shared -o codex-429-autoban.${{ matrix.ext }} .
+        shell: bash
+
+      - name: Compute version (tag without leading v)
+        id: ver
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+        shell: bash
+
+      - name: Pack zip (library at zip root)
+        run: |
+          mkdir -p staging
+          cp codex-429-autoban.${{ matrix.ext }} staging/
+          asset="codex-429-autoban_${{ steps.ver.outputs.version }}_${{ matrix.goos }}_${{ matrix.goarch }}.zip"
+          ( cd staging && zip -X "../${asset}" codex-429-autoban.${{ matrix.ext }} )
+          echo "asset=${asset}" >> "$GITHUB_OUTPUT"
+        shell: bash
+        id: pack
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pack.outputs.asset }}
+          path: ${{ steps.pack.outputs.asset }}
+          if-no-files-found: error
+
+  release:
+    name: Publish checksums and Release assets
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Compute version
+        id: ver
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+
+      - name: Generate checksums.txt
+        run: |
+          cd assets
+          sha256sum *.zip > checksums.txt
+          cat checksums.txt
+
+      - name: Upload assets to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            assets/*.zip
+            assets/checksums.txt
+          generate_release_notes: true
