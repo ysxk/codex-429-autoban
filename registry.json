@@ -6,7 +6,7 @@
       "name": "Codex 429 Autoban",
       "description": "Auto-disable Codex credentials after 429 and manually re-enable them after quota reset.",
       "author": "ysxk",
-      "version": "0.2.0",
+      "version": "0.2.1",
       "repository": "https://github.com/ysxk/codex-429-autoban",
       "homepage": "https://github.com/ysxk/codex-429-autoban",
       "license": "MIT",

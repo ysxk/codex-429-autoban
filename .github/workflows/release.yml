@@ -7,6 +7,7 @@
 #
 # Output assets (version = tag without the leading "v"):
 #   codex-429-autoban_<version>_linux_amd64.zip      -> codex-429-autoban.so
+#   codex-429-autoban_<version>_linux_arm64.zip      -> codex-429-autoban.so
 #   codex-429-autoban_<version>_darwin_arm64.zip     -> codex-429-autoban.dylib
 #   codex-429-autoban_<version>_windows_amd64.zip    -> codex-429-autoban.dll
 #   checksums.txt
@@ -31,6 +32,10 @@ jobs:
           - goos: linux
             goarch: amd64
             runner: ubuntu-latest
+            ext: so
+          - goos: linux
+            goarch: arm64
+            runner: ubuntu-22.04-arm
             ext: so
           - goos: darwin
             goarch: arm64
@@ -58,6 +63,13 @@ jobs:
           GOARCH: ${{ matrix.goarch }}
         run: |
           go build -buildmode=c-shared -o codex-429-autoban.${{ matrix.ext }} .
+        shell: bash
+
+      - name: Verify Linux dynamic library
+        if: matrix.goos == 'linux'
+        run: |
+          file codex-429-autoban.${{ matrix.ext }}
+          ldd codex-429-autoban.${{ matrix.ext }}
         shell: bash
 
       - name: Compute version (tag without leading v)
