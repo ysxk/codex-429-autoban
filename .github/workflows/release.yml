@@ -7,6 +7,7 @@
 #
 # Output assets (version = tag without the leading "v"):
 #   codex-429-autoban_<version>_linux_amd64.zip      -> codex-429-autoban.so
+#   codex-429-autoban_<version>_linux_arm64.zip      -> codex-429-autoban.so
 #   codex-429-autoban_<version>_darwin_arm64.zip     -> codex-429-autoban.dylib
 #   codex-429-autoban_<version>_windows_amd64.zip    -> codex-429-autoban.dll
 #   checksums.txt
@@ -32,6 +33,10 @@ jobs:
             goarch: amd64
             runner: ubuntu-latest
             ext: so
+          - goos: linux
+            goarch: arm64
+            runner: ubuntu-latest
+            ext: so
           - goos: darwin
             goarch: arm64
             runner: macos-latest
@@ -50,6 +55,13 @@ jobs:
         with:
           go-version: "1.23"
           cache: true
+
+      - name: Set up Linux ARM64 cross toolchain
+        if: matrix.goos == 'linux' && matrix.goarch == 'arm64'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+          echo "CC=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
 
       - name: Build dynamic library
         env:
