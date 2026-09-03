@@ -1,34 +1,35 @@
-# codex-429-autoban
+# codex-429-autoban-monthly
 
 一个 CPA（CLIProxyAPI）插件：**Codex 凭证收到 429（限流）后自动禁用，并在对应限额窗口刷新后自动解禁。**
 
 ## 它做什么
 
 1. **检测 429**：每次请求完成后，插件观察用量记录。如果某个 **codex** 凭证收到了 429，就触发禁用逻辑。
-2. **判断禁多久**：读上游 OpenAI 返回的 `x-codex-*` 响应头，判断是 **5 小时窗口**被打满，还是 **周限额**被打满，并取对应窗口的刷新时间作为解禁时间。
+2. **判断禁多久**：读上游 OpenAI 返回的 `x-codex-*` 响应头，使用实际的 `reset-at` 时间。支持 **5 小时、周限额、Free tier 月限额**及未知的 provider-specific 窗口。
    - 5 小时窗口满了 → 5 小时刷新后解禁
    - 周窗口满了 → 下周刷新时才解禁
-   - 两个都满 → 按较晚的（周）解禁
+   - 月窗口满了 → 月限额刷新时才解禁
+   - 两个都满 → 按较晚的窗口解禁
 3. **自动解禁**：之后每次 CPA 选凭证时，插件把"还没到解禁时间"的凭证从候选里剔除；一旦过了刷新时间，自动放回候选。
 4. **手动加回号池**：如果你在 Codex 侧手动重置额度或使用了重置卡，可以通过插件的 Management API / 资源页立即解除插件内存里的 ban，不必等原来的 `reset-at`。
 5. **只管 codex**：非 codex 凭证一律不干预，交给 CPA 原有逻辑。
 
-## 怎么判断 5 小时还是周限额
+## 怎么判断限额窗口
 
-OpenAI 的 ChatGPT/Codex 后端在 429 时会返回一组自定义头（不是标准的 `x-ratelimit-*`）：
+OpenAI 的 ChatGPT/Codex 后端在 429 时会返回一组自定义头（不是标准的 `x-ratelimit-*`）。插件优先使用实际 `reset-at`，不把未知窗口强行映射成 5 小时：
 
 | 响应头 | 含义 |
 |---|---|
-| `x-codex-primary-window-minutes` | `300` = 5 小时窗口 |
-| `x-codex-primary-reset-at` | 5 小时窗口刷新时间（Unix 秒） |
-| `x-codex-primary-used-percent` | 5 小时窗口使用率（打满时 = 100） |
-| `x-codex-secondary-window-minutes` | `10080` = 7 天（周）窗口 |
-| `x-codex-secondary-reset-at` | 周窗口刷新时间（Unix 秒） |
-| `x-codex-secondary-used-percent` | 周窗口使用率 |
+| `x-codex-primary-window-minutes` | `300` = 5 小时；`40320`–`44640` = 28–31 天月窗口；其他值也支持 |
+| `x-codex-primary-reset-at` | 对应窗口刷新时间（Unix 秒或 RFC3339） |
+| `x-codex-primary-used-percent` | 窗口使用率（打满时 = 100） |
+| `x-codex-secondary-window-minutes` | `10080` = 7 天（周）窗口；其他值也支持 |
+| `x-codex-secondary-reset-at` | 对应窗口刷新时间（Unix 秒或 RFC3339） |
+| `x-codex-secondary-used-percent` | 窗口使用率 |
 
-**判断逻辑**：哪个窗口的 `used-percent` 到了 100，就用那个窗口的 `reset-at` 作为解禁时间。
+**判断逻辑**：哪个窗口到 100，就用那个窗口的 `reset-at`；如果两个都满，使用较晚的 `reset-at`。
 
-> 如果 429 响应里没有这些头（少数情况，比如来自中间代理的伪 429），插件保守地按 5 小时禁用（这是更常见的情形）。
+> 如果 429 响应里没有 reset-at 头，插件保守地按 31 天禁用；不会再错误地按 5 小时解禁 Free tier 月限额账号。
 
 ## 为什么解禁不需要定时器
 

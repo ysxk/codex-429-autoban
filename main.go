@@ -1,13 +1,12 @@
-// Package main implements the codex-429-autoban CPA plugin.
+// Package main implements the codex-429-autoban-monthly CPA plugin.
 //
 // It auto-disables a Codex credential after a 429 and auto-re-enables it
 // once the rate-limit window that was hit has refreshed.
 //
 // Three capabilities are registered:
 //   - usage_plugin: observes every completed request. On a Codex 429 it reads
-//     the upstream x-codex-* response headers, decides whether the 5-hour
-//     window or the weekly cap was exhausted, and records the exact reset
-//     time at which the credential may be used again.
+//     the upstream x-codex-* response headers, uses the actual reset time,
+//     and supports Free-tier monthly windows.
 //   - scheduler: on every credential pick, it drops candidates whose recorded
 //     reset time has not yet passed (lazy re-enable, since CPA exposes no
 //     timer hook) and delegates the actual selection to the built-in
@@ -68,7 +67,7 @@ import (
 
 const (
 	pluginName    = "codex-429-autoban"
-	pluginVersion = "0.2.2"
+	pluginVersion = "0.3.0"
 
 	// providerCodex is the CPA provider key for OpenAI Codex (ChatGPT backend).
 	providerCodex = "codex"
@@ -141,7 +140,7 @@ func (s *banState) clearIfExpired(authID string, now time.Time) (stillBanned boo
 	if !now.Before(e.ResetAt) {
 		// Reset time has passed: auto re-enable.
 		delete(s.bans, authID)
-		slog.Info("codex-429-autoban: auto re-enabled credential",
+		slog.Info("codex-429-autoban-monthly: auto re-enabled credential",
 			"auth_id", authID, "window", e.Window, "reset_at", e.ResetAt.Format(time.RFC3339))
 		return false
 	}
@@ -157,7 +156,7 @@ func (s *banState) clearExpired(now time.Time) int {
 		if !now.Before(e.ResetAt) {
 			delete(s.bans, authID)
 			removed++
-			slog.Info("codex-429-autoban: auto re-enabled credential",
+			slog.Info("codex-429-autoban-monthly: auto re-enabled credential",
 				"auth_id", authID, "window", e.Window, "reset_at", e.ResetAt.Format(time.RFC3339))
 		}
 	}
@@ -297,7 +296,7 @@ func handleUsage(raw []byte) ([]byte, error) {
 	}
 	var record pluginapi.UsageRecord
 	if errUnmarshal := json.Unmarshal(raw, &record); errUnmarshal != nil {
-		slog.Warn("codex-429-autoban: failed to decode usage record", "error", errUnmarshal)
+		slog.Warn("codex-429-autoban-monthly: failed to decode usage record", "error", errUnmarshal)
 		return okEnvelope(map[string]any{})
 	}
 
@@ -311,29 +310,29 @@ func handleUsage(raw []byte) ([]byte, error) {
 	}
 	authID := strings.TrimSpace(record.AuthID)
 	if authID == "" {
-		slog.Warn("codex-429-autoban: 429 received but AuthID is empty, cannot ban")
+		slog.Warn("codex-429-autoban-monthly: 429 received but AuthID is empty, cannot ban")
 		return okEnvelope(map[string]any{})
 	}
 
 	entry, ok := classifyAndBuildBan(record.ResponseHeaders)
 	if !ok {
-		// Could not determine which window was hit from the headers.
-		// Fall back to a conservative 5-hour ban so the credential is not
-		// hammered while rate-limited, matching the more common case.
+		// Without upstream reset metadata, use a conservative monthly hold.
+		// Never fall back to five hours: Free-tier monthly limits can remain
+		// exhausted for weeks and would otherwise be selected too early.
 		now := time.Now()
 		entry = banEntry{
-			ResetAt:  now.Add(5 * time.Hour),
-			Window:   "5h (fallback, headers missing)",
+			ResetAt:  now.Add(31 * 24 * time.Hour),
+			Window:   "month (fallback, headers missing)",
 			BannedAt: now,
 		}
-		slog.Warn("codex-429-autoban: x-codex-* headers missing on 429, falling back to 5h ban",
+		slog.Warn("codex-429-autoban-monthly: x-codex-* headers missing on 429, using conservative monthly fallback",
 			"auth_id", authID)
 	} else {
 		entry.BannedAt = time.Now()
 	}
 
 	banStore.set(authID, entry)
-	slog.Info("codex-429-autoban: banned credential after 429",
+	slog.Info("codex-429-autoban-monthly: banned credential after 429",
 		"auth_id", authID,
 		"window", entry.Window,
 		"reset_at", entry.ResetAt.Format(time.RFC3339))
@@ -354,46 +353,64 @@ func handleUsage(raw []byte) ([]byte, error) {
 //   - x-codex-secondary-used-percent   = 0-100
 func classifyAndBuildBan(headers http.Header) (banEntry, bool) {
 	h := headers
-
+	primaryWindow := headerInt(h, "x-codex-primary-window-minutes")
+	secondaryWindow := headerInt(h, "x-codex-secondary-window-minutes")
 	primaryUsed := headerFloat(h, "x-codex-primary-used-percent")
 	secondaryUsed := headerFloat(h, "x-codex-secondary-used-percent")
 	primaryReset := headerUnixTime(h, "x-codex-primary-reset-at")
 	secondaryReset := headerUnixTime(h, "x-codex-secondary-reset-at")
 
-	// Prefer the explicit "which window is full" signal: the window whose
-	// used-percent reached the threshold. If both are present, pick the one
-	// at threshold; if only one header family is present, use that.
+	// Prefer the explicit "which window is full" signal. Any valid reset-at
+	// is authoritative, including a 28-31 day Free-tier monthly window.
 	primaryFull := primaryUsed >= usedPercentThreshold
 	secondaryFull := secondaryUsed >= usedPercentThreshold
 
 	switch {
-	case secondaryFull && !primaryFull:
-		if !secondaryReset.IsZero() {
-			return banEntry{ResetAt: secondaryReset, Window: "week"}, true
-		}
-	case primaryFull && !secondaryFull:
-		if !primaryReset.IsZero() {
-			return banEntry{ResetAt: primaryReset, Window: "5h"}, true
-		}
+	case secondaryFull && !primaryFull && !secondaryReset.IsZero():
+		return banEntry{ResetAt: secondaryReset, Window: windowLabel(secondaryWindow)}, true
+	case primaryFull && !secondaryFull && !primaryReset.IsZero():
+		return banEntry{ResetAt: primaryReset, Window: windowLabel(primaryWindow)}, true
 	case primaryFull && secondaryFull:
-		// Both exhausted: must wait for the later reset (weekly) to be safe.
-		if !secondaryReset.IsZero() {
-			return banEntry{ResetAt: secondaryReset, Window: "week (both full)"}, true
-		}
-		if !primaryReset.IsZero() {
-			return banEntry{ResetAt: primaryReset, Window: "5h (both full, weekly reset missing)"}, true
-		}
-	default:
-		// Neither reports as full via used-percent. Fall back to window-minutes
-		// identity if a reset time is present, else give up.
-		if !primaryReset.IsZero() && headerInt(h, "x-codex-primary-window-minutes") == windowMinutes5h {
-			return banEntry{ResetAt: primaryReset, Window: "5h"}, true
-		}
-		if !secondaryReset.IsZero() && headerInt(h, "x-codex-secondary-window-minutes") == windowMinutesWeek {
-			return banEntry{ResetAt: secondaryReset, Window: "week"}, true
+		// If both limits are exhausted, wait for the later reset.
+		if resetAt, label := latestReset(primaryReset, windowLabel(primaryWindow), secondaryReset, windowLabel(secondaryWindow)); !resetAt.IsZero() {
+			return banEntry{ResetAt: resetAt, Window: label + " (both full)"}, true
 		}
 	}
+
+	// Some 429 responses omit used-percent. A valid reset-at remains safer and
+	// more accurate than guessing from a hardcoded 5h/weekly window.
+	if !primaryReset.IsZero() {
+		return banEntry{ResetAt: primaryReset, Window: windowLabel(primaryWindow)}, true
+	}
+	if !secondaryReset.IsZero() {
+		return banEntry{ResetAt: secondaryReset, Window: windowLabel(secondaryWindow)}, true
+	}
 	return banEntry{}, false
+}
+
+func latestReset(left time.Time, leftLabel string, right time.Time, rightLabel string) (time.Time, string) {
+	if left.IsZero() {
+		return right, rightLabel
+	}
+	if right.IsZero() || !right.After(left) {
+		return left, leftLabel
+	}
+	return right, rightLabel
+}
+
+func windowLabel(minutes int) string {
+	switch {
+	case minutes == windowMinutes5h:
+		return "5h"
+	case minutes == windowMinutesWeek:
+		return "week"
+	case minutes >= 28*24*60 && minutes <= 31*24*60:
+		return "month"
+	case minutes > 0:
+		return strconv.Itoa(minutes) + "m"
+	default:
+		return "unknown"
+	}
 }
 
 // handleSchedulerPick filters out credentials that are still banned, then
@@ -470,7 +487,7 @@ func managementRegistration() pluginapi.ManagementRegistrationResponse {
 			{
 				Method:      http.MethodGet,
 				Path:        managementRoutePrefix + "/bans",
-				Description: "List Codex auths currently held out of the pool by codex-429-autoban.",
+				Description: "List Codex auths currently held out of the pool by codex-429-autoban-monthly.",
 			},
 			{
 				Method:      http.MethodPost,
@@ -611,7 +628,7 @@ func handleManagementUnban(req pluginapi.ManagementRequest) pluginapi.Management
 
 	entry, removed := banStore.clear(authID)
 	if removed {
-		slog.Info("codex-429-autoban: manually re-enabled credential",
+		slog.Info("codex-429-autoban-monthly: manually re-enabled credential",
 			"auth_id", authID, "window", entry.Window, "reset_at", entry.ResetAt.Format(time.RFC3339))
 	}
 	return jsonManagementResponse(http.StatusOK, map[string]any{
@@ -625,7 +642,7 @@ func handleManagementUnban(req pluginapi.ManagementRequest) pluginapi.Management
 func handleManagementUnbanAll() pluginapi.ManagementResponse {
 	removed := banStore.clearAll()
 	if removed > 0 {
-		slog.Info("codex-429-autoban: manually re-enabled all credentials", "removed", removed)
+		slog.Info("codex-429-autoban-monthly: manually re-enabled all credentials", "removed", removed)
 	}
 	return jsonManagementResponse(http.StatusOK, map[string]any{
 		"ok":      true,
@@ -692,7 +709,7 @@ func managementStatusPage() string {
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>codex-429-autoban</title>
+  <title>codex-429-autoban-monthly</title>
   <style>
     :root { color-scheme: light dark; font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
     body { max-width: 980px; margin: 32px auto; padding: 0 16px; line-height: 1.5; }
@@ -711,7 +728,7 @@ func managementStatusPage() string {
   </style>
 </head>
 <body>
-  <h1>codex-429-autoban</h1>
+  <h1>codex-429-autoban-monthly</h1>
   <p class="muted">版本 ` + version + ` · 手动把已重置额度的 Codex 账号加回号池。</p>
 
   <div class="card">
@@ -732,13 +749,13 @@ func managementStatusPage() string {
 
   <div class="card">
     <h2>API</h2>
-    <pre>GET  /v0/management/plugins/codex-429-autoban/bans
-POST /v0/management/plugins/codex-429-autoban/unban      {"auth_id":"..."}
-POST /v0/management/plugins/codex-429-autoban/unban-all</pre>
+    <pre>GET  /v0/management/plugins/codex-429-autoban-monthly/bans
+POST /v0/management/plugins/codex-429-autoban-monthly/unban      {"auth_id":"..."}
+POST /v0/management/plugins/codex-429-autoban-monthly/unban-all</pre>
   </div>
 
   <script>
-    const apiBase = "/v0/management/plugins/codex-429-autoban";
+    const apiBase = "/v0/management/plugins/codex-429-autoban-monthly";
     const keyInput = document.getElementById("key");
     const savedKey = localStorage.getItem("codex429AutobanManagementKey") || "";
     keyInput.value = savedKey;
@@ -865,18 +882,19 @@ func headerInt(h http.Header, key string) int {
 }
 
 func headerUnixTime(h http.Header, key string) time.Time {
-	raw := h.Get(key)
+	raw := strings.TrimSpace(h.Get(key))
 	if raw == "" {
 		return time.Time{}
 	}
-	secs, err := strconv.ParseInt(raw, 10, 64)
-	if err != nil {
-		return time.Time{}
+	if secs, err := strconv.ParseInt(raw, 10, 64); err == nil && secs > 0 {
+		return time.Unix(secs, 0)
 	}
-	if secs <= 0 {
-		return time.Time{}
+	for _, layout := range []string{time.RFC3339, time.RFC3339Nano} {
+		if parsed, err := time.Parse(layout, raw); err == nil {
+			return parsed
+		}
 	}
-	return time.Unix(secs, 0)
+	return time.Time{}
 }
 
 // ---- envelope / response helpers ----

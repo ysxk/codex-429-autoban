@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Build the codex-429-autoban plugin.
+# Build the codex-429-autoban-monthly plugin.
 # CGO is mandatory for CPA plugins, so a C compiler (gcc/clang) must be on PATH.
-# Output: codex-429-autoban.dll (windows), .dylib (darwin), .so (linux).
+# Output: codex-429-autoban-monthly.dll (windows), .dylib (darwin), .so (linux).
 set -euo pipefail
 
 ext="so"
