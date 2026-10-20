@@ -8,10 +8,12 @@
 //     the upstream x-codex-* response headers, decides whether the 5-hour
 //     window or the weekly cap was exhausted, and records the exact reset
 //     time at which the credential may be used again.
-//   - scheduler: on every credential pick, it drops candidates whose recorded
-//     reset time has not yet passed (lazy re-enable, since CPA exposes no
-//     timer hook) and delegates the actual selection to the built-in
-//     round-robin scheduler.
+	//   - scheduler: on every credential pick, it drops candidates whose recorded
+	//     reset time has not yet passed (lazy re-enable, since CPA exposes no
+	//     timer hook). When all candidates are healthy, it returns Handled: false
+	//     to preserve host routing (session affinity, weighted round-robin).
+	//     When a subset is banned, it dispatches healthy candidates via session
+	//     affinity hashing or smooth weighted round-robin.
 //   - management_api: exposes a small status page and authenticated API for
 //     manually clearing the in-memory ban state after the user resets Codex
 //     quota or uses a reset card upstream.
@@ -68,7 +70,7 @@ import (
 
 const (
 	pluginName    = "codex-429-autoban"
-	pluginVersion = "0.2.2"
+	pluginVersion = "0.2.3"
 
 	// providerCodex is the CPA provider key for OpenAI Codex (ChatGPT backend).
 	providerCodex = "codex"
@@ -396,8 +398,201 @@ func classifyAndBuildBan(headers http.Header) (banEntry, bool) {
 	return banEntry{}, false
 }
 
-// handleSchedulerPick filters out credentials that are still banned, then
-// delegates the actual selection to the built-in round-robin scheduler.
+// extractSessionID looks for explicit or derived session markers in request headers and metadata.
+func extractSessionID(options pluginapi.SchedulerOptions) string {
+	sessionHeaderKeys := [...]string{
+		"session-id",
+		"session_id",
+		"x-session-id",
+		"x-session-affinity",
+		"x-slot-session-id",
+		"x-conversation-id",
+		"x-thread-id",
+		"x-client-request-id",
+		"x-claude-code-session-id",
+	}
+	if len(options.Headers) > 0 {
+		for _, key := range sessionHeaderKeys {
+			for hKey, values := range options.Headers {
+				if strings.EqualFold(hKey, key) && len(values) > 0 {
+					val := strings.TrimSpace(values[0])
+					if val != "" {
+						return val
+					}
+				}
+			}
+		}
+	}
+
+	if len(options.Metadata) > 0 {
+		metadataKeys := [...]string{
+			"session_id",
+			"execution_session_id",
+			"derived_session_id",
+			"parent_session_id",
+			"conversation_id",
+		}
+		for _, key := range metadataKeys {
+			if raw, ok := options.Metadata[key]; ok && raw != nil {
+				if str, okStr := raw.(string); okStr {
+					val := strings.TrimSpace(str)
+					if val != "" {
+						return val
+					}
+				}
+			}
+		}
+	}
+	return ""
+}
+
+// candidateWeight extracts the positive integer weight of an auth candidate, defaulting to 1.
+func candidateWeight(c pluginapi.SchedulerAuthCandidate) int64 {
+	if c.Attributes != nil {
+		if raw, ok := c.Attributes["weight"]; ok {
+			if w, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 64); err == nil && w > 0 {
+				return w
+			}
+		}
+	}
+	if c.Metadata != nil {
+		if raw, ok := c.Metadata["weight"]; ok && raw != nil {
+			switch v := raw.(type) {
+			case int:
+				if v > 0 {
+					return int64(v)
+				}
+			case int64:
+				if v > 0 {
+					return v
+				}
+			case float64:
+				if v > 0 {
+					return int64(v)
+				}
+			case string:
+				if w, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64); err == nil && w > 0 {
+					return w
+				}
+			}
+		}
+	}
+	return 1
+}
+
+// fnv1a64 computes a 64-bit FNV-1a hash of s.
+func fnv1a64(s string) uint64 {
+	var h uint64 = 14695981039346656037
+	for i := 0; i < len(s); i++ {
+		h ^= uint64(s[i])
+		h *= 1099511628211
+	}
+	return h
+}
+
+// pickBySessionAffinity deterministically maps a sessionID to a candidate in candidates,
+// honoring relative candidate weights to maximize prompt cache reuse.
+func pickBySessionAffinity(candidates []pluginapi.SchedulerAuthCandidate, sessionID string) pluginapi.SchedulerAuthCandidate {
+	if len(candidates) == 0 {
+		return pluginapi.SchedulerAuthCandidate{}
+	}
+	if len(candidates) == 1 {
+		return candidates[0]
+	}
+
+	sorted := make([]pluginapi.SchedulerAuthCandidate, len(candidates))
+	copy(sorted, candidates)
+	sort.Slice(sorted, func(i, j int) bool {
+		return sorted[i].ID < sorted[j].ID
+	})
+
+	var totalWeight int64
+	for _, c := range sorted {
+		totalWeight += candidateWeight(c)
+	}
+	if totalWeight <= 0 {
+		totalWeight = int64(len(sorted))
+	}
+
+	target := int64(fnv1a64(sessionID) % uint64(totalWeight))
+	var cumulative int64
+	for _, c := range sorted {
+		cumulative += candidateWeight(c)
+		if target < cumulative {
+			return c
+		}
+	}
+	return sorted[len(sorted)-1]
+}
+
+// weightedRoundRobinPicker implements NGINX-style smooth weighted round-robin.
+type weightedRoundRobinPicker struct {
+	mu            sync.Mutex
+	currentWeight map[string]int64
+}
+
+var fallbackWRR weightedRoundRobinPicker
+
+func (p *weightedRoundRobinPicker) pick(candidates []pluginapi.SchedulerAuthCandidate) pluginapi.SchedulerAuthCandidate {
+	if len(candidates) == 0 {
+		return pluginapi.SchedulerAuthCandidate{}
+	}
+	if len(candidates) == 1 {
+		return candidates[0]
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.currentWeight == nil {
+		p.currentWeight = make(map[string]int64)
+	} else if len(p.currentWeight) > 1024 {
+		valid := make(map[string]bool, len(candidates))
+		for _, c := range candidates {
+			valid[c.ID] = true
+		}
+		for k := range p.currentWeight {
+			if !valid[k] {
+				delete(p.currentWeight, k)
+			}
+		}
+	}
+
+	var totalWeight int64
+	var bestCandidate pluginapi.SchedulerAuthCandidate
+	var maxCurrent int64 = -1 << 62
+	foundBest := false
+
+	for _, c := range candidates {
+		w := candidateWeight(c)
+		totalWeight += w
+		p.currentWeight[c.ID] += w
+		if !foundBest || p.currentWeight[c.ID] > maxCurrent {
+			maxCurrent = p.currentWeight[c.ID]
+			bestCandidate = c
+			foundBest = true
+		}
+	}
+
+	p.currentWeight[bestCandidate.ID] -= totalWeight
+	return bestCandidate
+}
+
+// handleSchedulerPick filters out credentials that are still banned.
+//
+// CPA integration rules:
+//  1. When no candidates are banned (len(available) == len(Candidates)), we return Handled: false.
+//     This lets CPA's own router/selector execute without interference, preserving user-configured
+//     routing strategies such as session affinity (prompt cache reuse) and weighted round-robin.
+//  2. When every candidate is banned (len(available) == 0), we return Handled: false so CPA can
+//     trigger its native cooling / failover / error handling.
+//  3. When a subset of candidates is banned, CPA's DelegateBuiltin cannot restrict its candidate pool
+//     to the healthy subset (it always operates over the full candidate set). Therefore, the plugin
+//     must pick a healthy AuthID directly:
+//       - Candidates are grouped by highest priority tier.
+//       - If a session marker (header/metadata) is present, deterministic weighted affinity hashing
+//         is used to stick the session to a healthy credential.
+//       - If no session marker is present, smooth weighted round-robin distributes traffic evenly.
 func handleSchedulerPick(raw []byte) ([]byte, error) {
 	var req pluginapi.SchedulerPickRequest
 	if errUnmarshal := json.Unmarshal(raw, &req); errUnmarshal != nil {
@@ -420,40 +615,52 @@ func handleSchedulerPick(raw []byte) ([]byte, error) {
 		available = append(available, candidate)
 	}
 
-	// If every Codex candidate is banned (and there were no non-Codex ones),
-	// decline to handle so CPA's own logic can decide (e.g. wait on its
-	// built-in cooldown, or return an error). We do not force a pick here.
+	// Case 1: Every candidate is banned (or candidate list was empty).
+	// Decline to handle so CPA can decide (e.g. wait on its built-in cooldown, or return an error).
 	if len(available) == 0 {
 		return okEnvelope(pluginapi.SchedulerPickResponse{Handled: false})
 	}
 
-	// CPA applies our response as follows (conductor.go):
-	//   - if AuthID is set and matches a candidate  -> use exactly that one
-	//   - else if DelegateBuiltin is set            -> run the built-in
-	//                                                   scheduler over the FULL
-	//                                                   candidate set (it cannot
-	//                                                   be shrunk by the plugin)
-	//   - else (Handled false)                      -> host falls back to its
-	//                                                   own built-in scheduler
-	//
-	// Because DelegateBuiltin would let round-robin pick a banned credential,
-	// when anything is banned we pick an available AuthID ourselves. When
-	// nothing is banned we delegate to round-robin to preserve normal
-	// load-balancing.
+	// Case 2: No candidates are banned.
+	// Return Handled: false to let CPA execute user-configured selector strategies (session affinity,
+	// weighted round-robin, fill-first) seamlessly.
 	if len(available) == len(req.Candidates) {
-		return okEnvelope(pluginapi.SchedulerPickResponse{
-			DelegateBuiltin: pluginapi.SchedulerBuiltinRoundRobin,
-			Handled:         true,
-		})
+		return okEnvelope(pluginapi.SchedulerPickResponse{Handled: false})
 	}
-	// Pick the available candidate with the highest numeric priority value
-	// (CPA's convention: higher priority value = higher precedence).
-	chosen := available[0]
+
+	// Case 3: A partial set of candidates is banned. Pick an available candidate directly.
+	// Step 3a: Select highest priority tier.
+	maxPriority := available[0].Priority
 	for _, c := range available[1:] {
-		if c.Priority > chosen.Priority {
-			chosen = c
+		if c.Priority > maxPriority {
+			maxPriority = c.Priority
 		}
 	}
+	var bestTier []pluginapi.SchedulerAuthCandidate
+	for _, c := range available {
+		if c.Priority == maxPriority {
+			bestTier = append(bestTier, c)
+		}
+	}
+
+	if len(bestTier) == 1 {
+		return okEnvelope(pluginapi.SchedulerPickResponse{
+			AuthID:  bestTier[0].ID,
+			Handled: true,
+		})
+	}
+
+	// Step 3b: Sticky session affinity if request carries a session marker.
+	if sessionID := extractSessionID(req.Options); sessionID != "" {
+		chosen := pickBySessionAffinity(bestTier, sessionID)
+		return okEnvelope(pluginapi.SchedulerPickResponse{
+			AuthID:  chosen.ID,
+			Handled: true,
+		})
+	}
+
+	// Step 3c: Fall back to smooth weighted round-robin among the healthy best tier.
+	chosen := fallbackWRR.pick(bestTier)
 	return okEnvelope(pluginapi.SchedulerPickResponse{
 		AuthID:  chosen.ID,
 		Handled: true,
